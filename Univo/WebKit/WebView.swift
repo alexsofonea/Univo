@@ -15,7 +15,7 @@ struct WebView: NSViewRepresentable {
     
     var onWebViewCreated: ((WKWebView) -> Void)?
     
-    var tecky: Tecky = Tecky.shared
+    var univo: Univo = Univo.shared
     var accessibilityService = AccessibilityService.shared
     private var menuService = MenuService.shared
     
@@ -185,20 +185,11 @@ struct WebView: NSViewRepresentable {
                         
                     case "taskInit":
                         if let taskName = messageBody["data"] as? String {
-                            if !taskName.hasPrefix("///") {
-                                print("Task initialized: \(taskName)")
-                                parent.tecky.handleNewTask(prompt: taskName)
-                            } else {
-                                webView!.evaluateJavaScript(taskName, completionHandler: nil)
-                            }
-
+                            //print("Initializing task: \(taskName)")
+                            parent.univo.handleNewTask(prompt: taskName)
                         }
                     case "taskCancel":
-                        parent.tecky.stopAllExecution()
-                    case "continueResponse":
-                        parent.tecky.continueResponse()
-                    case "rejectResponse":
-                        parent.tecky.rejectPlan()
+                        parent.univo.stopAllExecution()
                     case "glow":
                         if let glowData = messageBody["data"] as? String {
                             if glowData == "true" {
@@ -238,7 +229,7 @@ struct WebView: NSViewRepresentable {
                         
                     case "factory_reset":
                         let alert = NSAlert()
-                        alert.messageText = "Reset Tecky?"
+                        alert.messageText = "Reset Univo?"
                         alert.informativeText = "This will clear onboarding progress and quit the app. Are you sure?"
                         alert.alertStyle = .warning
                         alert.addButton(withTitle: "Reset and Quit")

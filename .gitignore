@@ -1,0 +1,7 @@
+**/.DS_Store
+**/db.php
+**/log.txt
+**/log2.txt
+cloud/
+api/v1/lock/
+Controller/Controller/Vision/binary/TeckyYOLODaemon

@@ -212,6 +212,7 @@
     // We'll compute a smoothed RMS level and map it to shader uniforms.
     let audioCtx = null;
     let analyser = null;
+    let audioStream = null;
     let dataArray = null;
     let audioSmoothed = 0;
     const audioSmoothing = 0.12; // EMA smoothing for RMS (bigger = smoother/slower)
@@ -232,10 +233,15 @@
     const maxDensityMultiplier = 1.4; // uDensity won't go above base * this
     const maxTimeScale = 1.4;         // time multiplier cap
 
+    // Start audio capture and return a promise that resolves once the analyser is ready.
+    // This allows us to attempt starting audio on load while keeping recording toggles separate.
     function startAudio() {
-        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
+      return new Promise((resolve, reject) => {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return reject(new Error('getUserMedia not supported'));
         navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+          try {
             audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            audioStream = stream; // keep stream so we can reuse for recording
             const source = audioCtx.createMediaStreamSource(stream);
             analyser = audioCtx.createAnalyser();
             analyser.fftSize = 2048;
@@ -243,14 +249,231 @@
             analyser.smoothingTimeConstant = 0.95;
             source.connect(analyser);
             dataArray = new Float32Array(analyser.fftSize);
+            resolve(stream);
+          } catch (err) {
+            console.warn('startAudio failed', err);
+            reject(err);
+          }
         }).catch(err => {
-            // user denied or not available — continue with default animation values
-            console.warn('Microphone unavailable or permission denied', err);
+          // user denied or not available — continue with default animation values
+          console.warn('Microphone unavailable or permission denied', err);
+          reject(err);
         });
+      });
     }
 
-    // Try to start audio capture right away
-    startAudio();
+    // Try to start audio capture right away so the animation responds continuously by default.
+    // startAudio() returns a Promise; we don't await it here because permission prompts
+    // may be shown and we don't want to block the rest of the script.
+    startAudio().catch(() => {
+      // We'll continue without audio; recording clicks can still request permission when needed.
+    });
+
+    // ---------- Recording toggle (click canvas to start/stop) ----------
+    let mediaRecorder = null;
+    let recordingChunks = [];
+    let recording = false;
+    // Fallback arrays for ScriptProcessor-based capture
+    let pcmData = [];
+    let pcmWorkerNode = null;
+
+    // Helper: ensure we have a stream (start audio if needed)
+    function ensureStream() {
+      return new Promise((resolve, reject) => {
+        if (audioStream) return resolve(audioStream);
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return reject(new Error('getUserMedia not supported'));
+        navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+          audioStream = stream;
+          // also create audioCtx/analyser if they don't exist
+          if (!audioCtx) {
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const source = audioCtx.createMediaStreamSource(stream);
+            analyser = audioCtx.createAnalyser();
+            analyser.fftSize = 2048;
+            analyser.smoothingTimeConstant = 0.95;
+            source.connect(analyser);
+            dataArray = new Float32Array(analyser.fftSize);
+          }
+          resolve(stream);
+        }).catch(reject);
+      });
+    }
+
+    // Encode PCM Float32Array buffers to WAV (16-bit) and return a Blob
+    function encodeWAV(buffers, sampleRate) {
+      // interleave and convert
+      let totalLen = 0;
+      for (let i = 0; i < buffers.length; i++) totalLen += buffers[i].length;
+      const buffer = new ArrayBuffer(44 + totalLen * 2);
+      const view = new DataView(buffer);
+
+      function writeString(view, offset, string) {
+        for (let i = 0; i < string.length; i++) {
+          view.setUint8(offset + i, string.charCodeAt(i));
+        }
+      }
+
+      /* RIFF identifier */ writeString(view, 0, 'RIFF');
+      /* file length */ view.setUint32(4, 36 + totalLen * 2, true);
+      /* RIFF type */ writeString(view, 8, 'WAVE');
+      /* format chunk identifier */ writeString(view, 12, 'fmt ');
+      /* format chunk length */ view.setUint32(16, 16, true);
+      /* sample format (raw) */ view.setUint16(20, 1, true);
+      /* channel count */ view.setUint16(22, 1, true);
+      /* sample rate */ view.setUint32(24, sampleRate, true);
+      /* byte rate (sampleRate * blockAlign) */ view.setUint32(28, sampleRate * 2, true);
+      /* block align (channelCount * bytesPerSample) */ view.setUint16(32, 2, true);
+      /* bits per sample */ view.setUint16(34, 16, true);
+      /* data chunk identifier */ writeString(view, 36, 'data');
+      /* data chunk length */ view.setUint32(40, totalLen * 2, true);
+
+      // write the PCM samples
+      let offset = 44;
+      for (let i = 0; i < buffers.length; i++) {
+        const input = buffers[i];
+        for (let j = 0; j < input.length; j++, offset += 2) {
+          let s = Math.max(-1, Math.min(1, input[j]));
+          view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+        }
+      }
+
+      return new Blob([view], { type: 'audio/wav' });
+    }
+
+    // Convert Blob to base64 (dataURL) and extract base64 payload
+    function blobToBase64(blob) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          const dataUrl = reader.result;
+          // data:[<mediatype>][;base64],<data>
+          const comma = dataUrl.indexOf(',');
+          const base64 = dataUrl.substring(comma + 1);
+          resolve(base64);
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+      });
+    }
+
+    async function startRecording() {
+      try {
+        // Prefer using the already-started audio stream so the animation runs continuously.
+        if (!audioStream) {
+          // If audio wasn't started yet, request it now (this may prompt the user).
+          try {
+            await startAudio();
+          } catch (e) {
+            console.warn('Could not start audio for recording', e);
+            return;
+          }
+        }
+
+        const stream = audioStream;
+
+        recordingChunks = [];
+        pcmData = [];
+
+        if (window.MediaRecorder) {
+          try {
+            mediaRecorder = new MediaRecorder(stream);
+          } catch (e) {
+            mediaRecorder = null;
+          }
+        }
+
+        if (mediaRecorder) {
+          mediaRecorder.ondataavailable = e => {
+            if (e.data && e.data.size) recordingChunks.push(e.data);
+          };
+          mediaRecorder.start();
+          recording = true;
+          return;
+        }
+
+        // Fallback: capture raw PCM via ScriptProcessorNode
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const source = audioCtx.createMediaStreamSource(stream);
+        const bufferSize = 2048;
+        const recorderNode = (audioCtx.createScriptProcessor || audioCtx.createJavaScriptNode).call(audioCtx, bufferSize, 1, 1);
+        recorderNode.onaudioprocess = function (e) {
+          const input = e.inputBuffer.getChannelData(0);
+          // clone the float32 data
+          pcmData.push(new Float32Array(input));
+        };
+        source.connect(recorderNode);
+        recorderNode.connect(audioCtx.destination); // some browsers require a destination connection
+        pcmWorkerNode = recorderNode;
+        recording = true;
+      } catch (err) {
+        console.warn('Recording start failed', err);
+      }
+    }
+
+    async function stopRecordingAndSend() {
+      try {
+        recording = false;
+        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+          mediaRecorder.onstop = async () => {
+            const blob = new Blob(recordingChunks, { type: 'audio/webm' });
+            const base64 = await blobToBase64(blob);
+            postToNative(base64);
+          };
+          mediaRecorder.stop();
+          return;
+        }
+
+        // Fallback: stop script-processor and encode WAV
+        if (pcmWorkerNode) {
+          try {
+            pcmWorkerNode.disconnect();
+          } catch (e) {}
+          pcmWorkerNode = null;
+        }
+
+        if (pcmData.length === 0) {
+          // nothing recorded
+          postToNative('');
+          return;
+        }
+
+        // Flatten buffers
+        const buffers = [];
+        for (let i = 0; i < pcmData.length; i++) buffers.push(pcmData[i]);
+        const sampleRate = (audioCtx && audioCtx.sampleRate) ? audioCtx.sampleRate : 44100;
+        const wav = encodeWAV(buffers, sampleRate);
+        const base64 = await blobToBase64(wav);
+        postToNative(base64);
+      } catch (err) {
+        console.warn('Recording stop failed', err);
+      }
+    }
+
+    function postToNative(base64Audio) {
+      const payload = {
+        action: 'taskInit',
+        data: base64Audio
+      };
+      if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.callbackHandler && window.webkit.messageHandlers.callbackHandler.postMessage) {
+        window.webkit.messageHandlers.callbackHandler.postMessage(payload);
+      } else {
+        // fallback for desktop browsers while testing
+        console.log('postMessage payload:', payload);
+      }
+    }
+
+    // Toggle recording when clicking the canvas
+    const canvasEl = document.getElementById('canvas');
+    if (canvasEl) {
+      canvasEl.addEventListener('click', async () => {
+        if (!recording) {
+          await startRecording();
+          // optional visual feedback could be added here
+        } else {
+          await stopRecordingAndSend();
+        }
+      });
+    }
 
     // Adapted from original pen:
     const particleOneSideNum = window.innerWidth < 768 ? 400 : 800;
