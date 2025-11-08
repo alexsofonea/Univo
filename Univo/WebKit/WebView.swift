@@ -68,6 +68,9 @@ struct WebView: NSViewRepresentable {
                 print("Error listing files: \(error)")
             }
         }*/
+        
+        PermissionsService.acquireAccessibilityPrivileges(completion: { _ in })
+        PermissionsService.acquireScreenRecordingPrivileges(completion: { _ in })
 
         // Load the local index.html file
         if let indexPath = Bundle.main.path(forResource: fileName, ofType: "html", inDirectory: "www") {
@@ -249,6 +252,11 @@ struct WebView: NSViewRepresentable {
                         task.launch()
 
                         NSApplication.shared.terminate(nil)
+                        
+                    case "playSound":
+                        if let soundType = messageBody["data"] as? String {
+                            parent.univo.playSound(for: soundType)
+                        }
                     
                     default:
                         break

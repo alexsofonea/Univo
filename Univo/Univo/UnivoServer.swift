@@ -153,28 +153,11 @@ class UnivoServer {
                 return
             }
             if let text = String(data: data, encoding: .utf8) {
-                // Decode JSON to extract assistant's content
-                struct ChatResponse: Codable {
-                    struct Choice: Codable {
-                        struct Message: Codable {
-                            let role: String
-                            let content: String?
-                            let audio: String?   // 👈 add this
-                        }
-                        let index: Int
-                        let message: Message
-                    }
-                    let choices: [Choice]
-                }
-
                 if let jsonData = text.data(using: .utf8) {
-                    print("🟢 Tecky Raw Response: \(text)")
+                    //print("🟢 Tecky Raw Response: \(text)")
                     do {
                         let decoded = try JSONDecoder().decode(ChatResponse.self, from: jsonData)
                         if let msg = decoded.choices.first?.message {
-                            if let audioB64 = msg.audio {
-                                TeckyAudioPlayer.shared.play(base64: audioB64)
-                            }
                             let assistantText = msg.content ?? ""
                             completion(.success(assistantText))
                         } else {
@@ -200,6 +183,26 @@ final class TeckyAudioPlayer {
     
     private init() {}
     
+    func saveWavToDocuments(from data: Data, fileName: String = UUID().uuidString) -> URL? {
+        // Get the user's Documents directory
+        guard let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            print("🔴 Unable to access Documents directory")
+            return nil
+        }
+
+        // Build full file URL
+        let fileURL = documentsURL.appendingPathComponent("\(fileName).wav")
+
+        do {
+            try data.write(to: fileURL)
+            print("✅ WAV file saved at:", fileURL.path)
+            return fileURL
+        } catch {
+            print("🔴 Failed to save WAV:", error)
+            return nil
+        }
+    }
+    
     func play(base64: String) {
         fadeTimer?.invalidate()
         
@@ -207,6 +210,8 @@ final class TeckyAudioPlayer {
             print("🔴 Invalid base64 audio")
             return
         }
+        
+        _ = saveWavToDocuments(from: data, fileName: "univo_output")
         
         DispatchQueue.main.async {
             do {

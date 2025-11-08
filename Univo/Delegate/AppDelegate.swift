@@ -57,12 +57,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         // NSApp.appearance = NSAppearance(named: .darkAqua)
         
-        if !didComplete {
+        //if !didComplete {
             recreateWindow()
-        } else {
+        /*} else {
             UserDefaults.standard.set(false, forKey: "hasCompletedOnboardingUIWelcome")
             recreateWindow(fileName: "onboarding", onboarding: true)
-        }
+        }*/
     }
     
     func applicationDidBecomeActive(_ notification: Notification) {
@@ -128,7 +128,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         
         // Glowing animated border
-        if hasGlowOverlay {
+        /*if hasGlowOverlay {
             let glowOverlay = NSHostingView(rootView: GlowEffect(controller: glowController))
             glowOverlay.translatesAutoresizingMaskIntoConstraints = false
             glowOverlay.wantsLayer = true
@@ -143,7 +143,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 glowOverlay.topAnchor.constraint(equalTo: containerView.topAnchor),
                 glowOverlay.bottomAnchor.constraint(equalTo: containerView.bottomAnchor),
             ])
-        }
+        }*/
         // Draggable area (added last so it's above others, but only in the strip)
         let draggableArea = DraggableView()
         draggableArea.translatesAutoresizingMaskIntoConstraints = false

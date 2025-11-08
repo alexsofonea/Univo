@@ -3,7 +3,7 @@ import base64
 import tempfile
 import json
 import traceback
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List, Tuple
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -14,8 +14,16 @@ import argparse
 # =========================
 
 VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:6162/v1/chat/completions")
+
 ASR_MODEL_ID = os.environ.get("ASR_MODEL_ID", "openai/whisper-large-v3-turbo")
-TTS_MODEL_ID = os.environ.get("TTS_MODEL_ID", "suno/bark")
+
+# Default TTS = Kokoro (hexgrad/Kokoro-82M)
+# We treat any TTS_MODEL_ID containing "kokoro" as "use Kokoro backend".
+TTS_MODEL_ID = os.environ.get("TTS_MODEL_ID", "hexgrad/Kokoro-82M")
+
+# Kokoro options
+KOKORO_LANG = os.environ.get("KOKORO_LANG", "a")           # 'a' American English (see Kokoro docs for others)
+KOKORO_VOICE = os.environ.get("KOKORO_VOICE", "af_heart")  # must exist in Kokoro VOICES list
 
 # =========================
 # Globals
@@ -24,7 +32,9 @@ TTS_MODEL_ID = os.environ.get("TTS_MODEL_ID", "suno/bark")
 ASR_PIPELINE = None
 ASR_STATUS: Dict[str, Any] = {"state": "not_loaded", "message": "not started"}
 
-_TTS_MODEL = None  # (backend, model_obj, model_id)
+# _TTS_MODEL: (backend, model_obj, model_id_or_desc)
+# backend: "kokoro" or "hf"
+_TTS_MODEL: Optional[Tuple[str, Any, str]] = None
 _TTS_STATUS: Dict[str, Any] = {"state": "not_loaded", "message": "not started"}
 
 app = FastAPI(title="VLLM Orchestrator (ASR+TTS)")
@@ -52,7 +62,7 @@ def encode_file_to_base64(path: str) -> str:
 
 
 def _is_base64_audio_string(s: str) -> bool:
-    """Heuristic: does this string look like base64-encoded audio (wav/mp3/ogg/flac/mp4/m4a/etc)?"""
+    """Heuristic: does this string look like base64-encoded audio."""
     if not isinstance(s, str):
         return False
 
@@ -80,17 +90,17 @@ def _is_base64_audio_string(s: str) -> bool:
     # OGG
     if sig4 == b"OggS":
         return True
-    # MP3
+    # MP3 (ID3 header)
     if raw[:3] == b"ID3":
         return True
     # FLAC
     if sig4 == b"fLaC":
         return True
-    # MP4 / M4A / ISO BMFF (ftyp)
+    # MP4/M4A/ISO BMFF
     if sig8[4:8] == b"ftyp":
         return True
 
-    # Fallback: big opaque blob
+    # Fallback: big opaque blob → likely audio
     return len(raw) > 2000
 
 
@@ -161,10 +171,27 @@ def transcribe_file_with_asr(path: str) -> str:
 
 
 # =========================
-# TTS (HF Bark, minimal)
+# TTS Backends
 # =========================
 
+def _load_kokoro_tts():
+    """
+    Load Kokoro via KPipeline.
+
+    Uses hexgrad/Kokoro-82M under the hood (managed by kokoro lib).
+    """
+    from kokoro import KPipeline
+
+    print(f"[TTS] Loading Kokoro (lang={KOKORO_LANG}, voice={KOKORO_VOICE})")
+    # KPipeline chooses device internally; no need to pass device explicitly.
+    pipe = KPipeline(lang_code=KOKORO_LANG)
+    return pipe, KOKORO_VOICE
+
+
 def _load_hf_tts(model_id: str):
+    """
+    Generic Hugging Face text-to-speech pipeline as fallback.
+    """
     import torch
     from transformers import pipeline
 
@@ -179,22 +206,38 @@ def _load_hf_tts(model_id: str):
 
 
 def preload_tts_model(model_id: Optional[str] = None):
+    """
+    Initialize TTS backend based on TTS_MODEL_ID.
+
+    - If TTS_MODEL_ID contains "kokoro" → use Kokoro
+    - Else → use HF TTS pipeline
+    """
     global _TTS_MODEL, _TTS_STATUS, TTS_MODEL_ID
 
     if model_id:
         TTS_MODEL_ID = model_id
-    model_id = TTS_MODEL_ID
 
-    _TTS_STATUS.update({"state": "loading", "message": f"loading {model_id}"})
+    mid = (TTS_MODEL_ID or "").lower()
+    _TTS_STATUS.update({"state": "loading", "message": f"loading {TTS_MODEL_ID}"})
+
     try:
-        tts_pipe = _load_hf_tts(model_id)
-        _TTS_MODEL = ("hf", tts_pipe, model_id)
-        _TTS_STATUS.update({"state": "ready", "message": f"HF TTS ready ({model_id})"})
+        if "kokoro" in mid:
+            pipe, voice = _load_kokoro_tts()
+            _TTS_MODEL = ("kokoro", (pipe, voice), TTS_MODEL_ID)
+            _TTS_STATUS.update({"state": "ready", "message": f"Kokoro ready ({TTS_MODEL_ID})"})
+        else:
+            tts_pipe = _load_hf_tts(TTS_MODEL_ID)
+            _TTS_MODEL = ("hf", tts_pipe, TTS_MODEL_ID)
+            _TTS_STATUS.update({"state": "ready", "message": f"HF TTS ready ({TTS_MODEL_ID})"})
+
         return _TTS_MODEL
+
     except Exception as e:
         _TTS_MODEL = None
-        _TTS_STATUS.update({"state": "error", "message": f"TTS failed: {e}"})
+        msg = f"TTS failed: {e}"
+        print("[TTS]", msg)
         traceback.print_exc()
+        _TTS_STATUS.update({"state": "error", "message": msg})
         return None
 
 
@@ -203,6 +246,53 @@ def get_tts_model():
     if _TTS_MODEL is not None:
         return _TTS_MODEL
     return preload_tts_model()
+
+
+def _write_wav_base64_from_np(audio_np, sr: int = 24000) -> Optional[str]:
+    import numpy as np
+    import wave
+
+    if audio_np is None:
+        return None
+
+    audio_np = np.asarray(audio_np)
+
+    # mono
+    if audio_np.ndim > 1:
+        audio_np = audio_np.mean(axis=-1)
+
+    if audio_np.size == 0:
+        print("[TTS] empty audio array")
+        return None
+
+    # normalize to [-1, 1]
+    audio_float = audio_np.astype("float32")
+    max_abs = float(np.max(np.abs(audio_float)))
+    if max_abs == 0:
+        print("[TTS] silent audio")
+        return None
+    if max_abs > 1.0:
+        audio_float /= max_abs
+
+    audio_int16 = (audio_float * 32767.0).clip(-32768, 32767).astype("int16")
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    tmp_path = tmp.name
+    tmp.close()
+
+    try:
+        with wave.open(tmp_path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # 16-bit
+            wf.setframerate(sr)
+            wf.writeframes(audio_int16.tobytes())
+        return encode_file_to_base64(tmp_path)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
 
 def synthesize_text_to_base64(text: str) -> Optional[str]:
     if not text or not text.strip():
@@ -214,102 +304,73 @@ def synthesize_text_to_base64(text: str) -> Optional[str]:
         return None
 
     backend, model, used_id = tts_info
-    if backend != "hf":
+
+    try:
+        # =====================
+        # Kokoro backend
+        # =====================
+        if backend == "kokoro":
+            import numpy as np
+
+            pipe, voice = model
+            print(f"[TTS][Kokoro] Synthesizing: {text!r} (voice={voice})")
+
+            # Official pattern: generator yields (global_scores, partial_scores, audio)
+            gen = pipe(text, voice=voice)  # you can add speed=1.0, split_pattern=... if needed
+
+            chunks: List[np.ndarray] = []
+            for i, (gs, ps, audio) in enumerate(gen):
+                # audio is np.ndarray, 1D float32 in [-1, 1]
+                if audio is not None and len(audio) > 0:
+                    chunks.append(audio)
+
+            if not chunks:
+                print("[TTS][Kokoro] No audio chunks produced (check kokoro/espeak install & voice/lang).")
+                return None
+
+            audio_np = np.concatenate(chunks, axis=0)
+            return _write_wav_base64_from_np(audio_np, sr=24000)
+
+        # =====================
+        # HF backend
+        # =====================
+        if backend == "hf":
+            import numpy as np
+
+            print(f"[TTS][HF] Synthesizing with {used_id}: {text!r}")
+            out = model(text, forward_params={"do_sample": False})
+
+            audio = None
+            sr = 24000
+
+            if isinstance(out, dict):
+                audio = out.get("audio") or out.get("audio_values")
+                sr = out.get("sampling_rate", sr)
+            else:
+                audio = out
+
+            if audio is None:
+                print("[TTS][HF] No audio field in output")
+                return None
+
+            try:
+                sr = int(sr)
+            except Exception:
+                sr = 24000
+            if sr <= 0 or sr > 192000:
+                sr = 24000
+
+            audio_np = np.asarray(audio)
+            return _write_wav_base64_from_np(audio_np, sr=sr)
+
         print(f"[TTS] Unexpected backend={backend}, skipping")
         return None
 
-    print(f"[TTS] Synthesizing with backend=hf ({used_id}): {text}")
-    try:
-        out = model(text, forward_params={"do_sample": False})
-
-        # --- Normalize Bark / HF outputs safely ---
-        import numpy as np
-
-        audio = None
-        sr = 24000
-
-        if isinstance(out, dict):
-            # Explicitly check for None to avoid numpy truth-value issues
-            audio = out.get("audio")
-            if audio is None:
-                audio = out.get("audio_values")
-            sr = out.get("sampling_rate", sr)
-        else:
-            # Some pipelines may just return a numpy array / list
-            audio = out
-
-        if audio is None:
-            print("[TTS] HF TTS returned no audio")
-            return None
-
-        try:
-            sr = int(sr)
-        except Exception:
-            sr = 24000
-        if sr <= 0 or sr > 192000:
-            sr = 24000
-
-        audio_np = np.asarray(audio)
-
-        # --- Shape normalize ---
-        if audio_np.ndim == 1:
-            nchannels = 1
-        elif audio_np.ndim == 2:
-            # (samples, channels) or (channels, samples)
-            if audio_np.shape[1] <= 8:
-                nchannels = int(audio_np.shape[1])
-            elif audio_np.shape[0] <= 8:
-                audio_np = audio_np.T
-                nchannels = int(audio_np.shape[1])
-            else:
-                audio_np = audio_np.reshape(-1)
-                nchannels = 1
-        else:
-            audio_np = audio_np.reshape(-1)
-            nchannels = 1
-
-        if nchannels > 2:
-            # mixdown to mono if too many channels
-            audio_np = audio_np.mean(axis=-1)
-            nchannels = 1
-
-        if audio_np.size == 0:
-            print("[TTS] empty audio array")
-            return None
-
-        # --- Normalize to int16 ---
-        audio_float = audio_np.astype("float32")
-        max_abs = float(np.max(np.abs(audio_float)))
-        if max_abs == 0:
-            print("[TTS] silent audio")
-            return None
-        if max_abs > 1.0:
-            audio_float /= max_abs
-
-        audio_int16 = (audio_float * 32767.0).clip(-32768, 32767).astype(np.int16)
-
-        # --- Write temp WAV & base64 ---
-        import wave
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-        tmp_path = tmp.name
-        tmp.close()
-        try:
-            with wave.open(tmp_path, "wb") as wf:
-                wf.setnchannels(nchannels)
-                wf.setsampwidth(2)  # 16-bit
-                wf.setframerate(sr)
-                wf.writeframes(audio_int16.tobytes())
-            return encode_file_to_base64(tmp_path)
-        finally:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
-
     except Exception as e:
-        print(f"[TTS] HF synthesis failed: {e}")
+        print(f"[TTS] synthesis failed: {e}")
         traceback.print_exc()
         return None
+
 
 # =========================
 # vLLM Forward
@@ -351,9 +412,10 @@ async def chat_completions(request: Request):
     forwarding = dict(payload)
     messages = forwarding.get("messages") or []
 
-    # --- 1) Only touch the LAST user message ---
+    # --- 1) Only touch the LAST user message (ASR on audio) ---
     if isinstance(messages, list) and messages:
         messages = list(messages)
+
         for idx in range(len(messages) - 1, -1, -1):
             m = messages[idx]
             if not isinstance(m, dict) or m.get("role") != "user":
@@ -376,9 +438,9 @@ async def chat_completions(request: Request):
                         pass
                 break
 
-            # Case B: content is an array of parts (multimodal)
+            # Case B: multimodal-style array of parts
             if isinstance(content, list):
-                new_parts: list[dict] = []
+                new_parts: List[Dict[str, Any]] = []
 
                 for part_idx, part in enumerate(content):
                     if not isinstance(part, dict):
@@ -387,12 +449,12 @@ async def chat_completions(request: Request):
 
                     p_type = part.get("type")
 
-                    # 1) Always forward images unchanged
+                    # Pass images through unchanged
                     if p_type == "image_url":
                         new_parts.append(part)
                         continue
 
-                    # 2) Normal text: maybe it's base64 audio, maybe it's actual text
+                    # Text: could be base64 audio or real text
                     if p_type == "text" and isinstance(part.get("text"), str):
                         txt = part["text"]
                         if _is_base64_audio_string(txt):
@@ -408,11 +470,10 @@ async def chat_completions(request: Request):
                                 except Exception:
                                     pass
                         else:
-                            # real text, keep as-is
                             new_parts.append(part)
                         continue
 
-                    # 3) Optional explicit audio fields
+                    # Explicit audio attributes
                     candidate = None
                     if isinstance(part.get("audio"), str):
                         candidate = part["audio"]
@@ -436,16 +497,14 @@ async def chat_completions(request: Request):
                             except Exception:
                                 pass
                     else:
-                        # Not audio, keep as-is
                         new_parts.append(part)
 
                 messages[idx]["content"] = new_parts
-                # We handled the last user message; stop here
                 break
 
         forwarding["messages"] = messages
 
-    # --- 2) Show what goes to Tecky-One ---
+    # --- 2) Log what goes to vLLM ---
     print("\n➡️  [vLLM] Forwarding messages summary:")
     for i, m in enumerate(forwarding.get("messages") or []):
         if not isinstance(m, dict):
@@ -457,7 +516,7 @@ async def chat_completions(request: Request):
         else:
             print(f"   - [{i}] {m.get('role')}: <{type(c)}>")
 
-    # --- 3) Forward to Tecky-One ---
+    # --- 3) Forward to vLLM ---
     vllm_result = await forward_to_vllm(forwarding)
 
     print("\n🧠 [vLLM] raw response (truncated):")
@@ -466,7 +525,7 @@ async def chat_completions(request: Request):
     except Exception:
         print(str(vllm_result)[:1500], "...\n")
 
-    # --- 4) TTS: if message.content is JSON with "speech": "<text>", turn into base64 ---
+    # --- 4) TTS: if message.content is JSON with "speech": "<text>", attach base64 audio ---
     try:
         choices = vllm_result.get("choices")
         if isinstance(choices, list):
@@ -474,6 +533,7 @@ async def chat_completions(request: Request):
                 msg = choice.get("message") if isinstance(choice, dict) else None
                 if not isinstance(msg, dict):
                     continue
+
                 c = msg.get("content")
                 if not isinstance(c, str):
                     continue
@@ -490,7 +550,7 @@ async def chat_completions(request: Request):
                 print(f"🔊 [TTS] choice[{idx}] speech text: {speech_text!r}")
                 audio_b64 = synthesize_text_to_base64(speech_text)
                 if not audio_b64:
-                    print(f"❌ [TTS] choice[{idx}] TTS failed, keeping text")
+                    print(f"❌ [TTS] choice[{idx}] TTS failed, keeping text-only")
                     continue
 
                 parsed["speech"] = audio_b64

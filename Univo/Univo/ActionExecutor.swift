@@ -323,18 +323,10 @@ class ActionExecutor {
         if let s = any as? String, let d = Double(s) { return d }
         return nil
     }
-
-    // New helper: Convert various target formats to coordinates (with scaling)
     private func convertTargetToCoordinates(target: Any, image: CGImage) -> (Double, Double, [CGKeyCode])? {
-        // At the start, determine the screen size (logical size)
-        let screenSize = NSScreen.main?.frame.size ?? CGSize(width: image.width, height: image.height)
-        // Accepts:
-        // - [x1, y1, x2, y2] bbox: will use center
-        // - [x, y] raw pixels
-        // - [x, y] normalized (0-1): will convert to image size
-        // - Optionally, a modifier string or number as 3rd/5th element.
-        // - String: try to parse as JSON or "text(1726.0-375.0)"
-        // Returns (x, y, [mods])
+        // Get the main screen scale factor (Retina = 2.0, etc)
+        let scale = NSScreen.main?.backingScaleFactor ?? 1.0
+
         func extractMods(_ arr: [Any], idx: Int) -> [CGKeyCode] {
             var mods: [CGKeyCode] = []
             if arr.count > idx {
@@ -347,32 +339,49 @@ class ActionExecutor {
             }
             return mods
         }
-        // Handle array
+
+        func asDouble(_ any: Any) -> Double? {
+            if let n = any as? NSNumber { return n.doubleValue }
+            if let s = any as? String, let d = Double(s) { return d }
+            return nil
+        }
+
+        // If the target is an array, interpret it directly as coordinates
         if let arr = target as? [Any] {
-            // [x1, y1, x2, y2, mods?]: bbox
+            // [x1, y1, x2, y2, mods?] => use center point
             if arr.count >= 4,
-                let x1 = asDouble(arr[0]), let y1 = asDouble(arr[1]),
-                let x2 = asDouble(arr[2]), let y2 = asDouble(arr[3]) {
-                var px = (x1 + x2) / 2.0
-                var py = (y1 + y2) / 2.0
+               let x1 = asDouble(arr[0]), let y1 = asDouble(arr[1]),
+               let x2 = asDouble(arr[2]), let y2 = asDouble(arr[3]) {
+                let px = (x1 + x2) / 2.0
+                let py = (y1 + y2) / 2.0
                 let mods = extractMods(arr, idx: 4)
-                // Normalize to image size, then rescale to screen size
-                let normX = px / Double(image.width)
-                let normY = py / Double(image.height)
-                px = normX * Double(screenSize.width)
-                py = normY * Double(screenSize.height)
-                return (px, py, mods)
+                return (px / scale, py / scale, mods)
             }
-            // [x, y, mods?]: point
-            if arr.count >= 2, let x = asDouble(arr[0]), let y = asDouble(arr[1]) {
-                var px = x, py = y
+
+            // [x, y, mods?] => direct point
+            if arr.count >= 2,
+               let x = asDouble(arr[0]), let y = asDouble(arr[1]) {
                 let mods = extractMods(arr, idx: 2)
-                // Normalize to image size, then rescale to screen size
-                let normX = px / Double(image.width)
-                let normY = py / Double(image.height)
-                px = normX * Double(screenSize.width)
-                py = normY * Double(screenSize.height)
-                return (px, py, mods)
+                return (x / scale, y / scale, mods)
+            }
+        }
+
+        // If the target is a string like "[x, y]" or JSON
+        if let targetStr = target as? String {
+            if let data = targetStr.data(using: .utf8),
+               let arr = try? JSONSerialization.jsonObject(with: data) as? [Any] {
+                return convertTargetToCoordinates(target: arr, image: image)
+            }
+
+            // Fallback for pattern like "text(1726.0-375.0)"
+            let pattern = #"(\d+\.?\d*)-(\d+\.?\d*)"#
+            if let regex = try? NSRegularExpression(pattern: pattern),
+               let match = regex.firstMatch(in: targetStr, range: NSRange(targetStr.startIndex..., in: targetStr)) {
+                let xRange = Range(match.range(at: 1), in: targetStr)!
+                let yRange = Range(match.range(at: 2), in: targetStr)!
+                if let x = Double(targetStr[xRange]), let y = Double(targetStr[yRange]) {
+                    return (x / scale, y / scale, [])
+                }
             }
         }
         return nil

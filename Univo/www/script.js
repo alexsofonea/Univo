@@ -212,8 +212,14 @@
     // We'll compute a smoothed RMS level and map it to shader uniforms.
     let audioCtx = null;
     let analyser = null;
+    let micSource = null;
+    let micAnalyser = null;
     let audioStream = null;
     let dataArray = null;
+    let mediaElementSource = null;
+    let playbackAudioEl = null;
+    let playAnalyser = null;
+    let isPlayingAudio = false;
     let audioSmoothed = 0;
     const audioSmoothing = 0.12; // EMA smoothing for RMS (bigger = smoother/slower)
     const noiseFloor = 0.01; // below this is treated as silence
@@ -242,12 +248,14 @@
           try {
             audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             audioStream = stream; // keep stream so we can reuse for recording
-            const source = audioCtx.createMediaStreamSource(stream);
-            analyser = audioCtx.createAnalyser();
-            analyser.fftSize = 2048;
+            micSource = audioCtx.createMediaStreamSource(stream);
+            micAnalyser = audioCtx.createAnalyser();
+            micAnalyser.fftSize = 2048;
             // make the analyser itself smoother so the raw signal is less jumpy
-            analyser.smoothingTimeConstant = 0.95;
-            source.connect(analyser);
+            micAnalyser.smoothingTimeConstant = 0.95;
+            micSource.connect(micAnalyser);
+            // By default the animation analyser points to the mic analyser
+            analyser = micAnalyser;
             dataArray = new Float32Array(analyser.fftSize);
             resolve(stream);
           } catch (err) {
@@ -273,6 +281,8 @@
     let mediaRecorder = null;
     let recordingChunks = [];
     let recording = false;
+  let recordStartTime = 0;
+  let lastRecordingDuration = 0;
     // Fallback arrays for ScriptProcessor-based capture
     let pcmData = [];
     let pcmWorkerNode = null;
@@ -387,13 +397,19 @@
             if (e.data && e.data.size) recordingChunks.push(e.data);
           };
           mediaRecorder.start();
+          recordStartTime = Date.now();
+          // notify native to play start sound
+          if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.callbackHandler && window.webkit.messageHandlers.callbackHandler.postMessage) {
+            window.webkit.messageHandlers.callbackHandler.postMessage({ action: 'playSound', type: 'open' });
+          }
           recording = true;
           return;
         }
 
         // Fallback: capture raw PCM via ScriptProcessorNode
-        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        const source = audioCtx.createMediaStreamSource(stream);
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    // reuse existing micSource if present, otherwise create a temporary one for recording fallback
+    const source = micSource || audioCtx.createMediaStreamSource(stream);
         const bufferSize = 2048;
         const recorderNode = (audioCtx.createScriptProcessor || audioCtx.createJavaScriptNode).call(audioCtx, bufferSize, 1, 1);
         recorderNode.onaudioprocess = function (e) {
@@ -404,6 +420,11 @@
         source.connect(recorderNode);
         recorderNode.connect(audioCtx.destination); // some browsers require a destination connection
         pcmWorkerNode = recorderNode;
+        recordStartTime = Date.now();
+        // notify native to play start sound
+        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.callbackHandler && window.webkit.messageHandlers.callbackHandler.postMessage) {
+          window.webkit.messageHandlers.callbackHandler.postMessage({ action: 'playSound', type: 'open' });
+        }
         recording = true;
       } catch (err) {
         console.warn('Recording start failed', err);
@@ -413,8 +434,21 @@
     async function stopRecordingAndSend() {
       try {
         recording = false;
+        // compute duration
+        lastRecordingDuration = recordStartTime ? (Date.now() - recordStartTime) : 0;
+
+        // notify native to play stop sound
+        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.callbackHandler && window.webkit.messageHandlers.callbackHandler.postMessage) {
+          window.webkit.messageHandlers.callbackHandler.postMessage({ action: 'playSound', type: 'close' });
+        }
+
         if (mediaRecorder && mediaRecorder.state !== 'inactive') {
           mediaRecorder.onstop = async () => {
+            // if too short, ignore and don't send
+            if (lastRecordingDuration < 2000) {
+              console.log('Recording too short, not sending (ms):', lastRecordingDuration);
+              return;
+            }
             const blob = new Blob(recordingChunks, { type: 'audio/webm' });
             const base64 = await blobToBase64(blob);
             postToNative(base64);
@@ -433,7 +467,7 @@
 
         if (pcmData.length === 0) {
           // nothing recorded
-          postToNative('');
+          console.log('No PCM data recorded');
           return;
         }
 
@@ -441,6 +475,14 @@
         const buffers = [];
         for (let i = 0; i < pcmData.length; i++) buffers.push(pcmData[i]);
         const sampleRate = (audioCtx && audioCtx.sampleRate) ? audioCtx.sampleRate : 44100;
+        // compute approximate duration from samples
+        let totalSamples = 0;
+        for (let i = 0; i < buffers.length; i++) totalSamples += buffers[i].length;
+        const durationSec = totalSamples / sampleRate;
+        if (durationSec * 1000 < 2000) {
+          console.log('PCM recording too short, not sending (ms):', durationSec * 1000);
+          return;
+        }
         const wav = encodeWAV(buffers, sampleRate);
         const base64 = await blobToBase64(wav);
         postToNative(base64);
@@ -473,6 +515,290 @@
           await stopRecordingAndSend();
         }
       });
+    }
+
+    // Play base64 audio (raw base64 without data: prefix by default).
+    // mimeHint can be e.g. 'audio/wav' or 'audio/webm'. We'll try mimeHint first and
+    // fall back to the other common type if playback fails.
+    async function playBase64Audio(base64, mimeHint = 'audio/wav') {
+      // window.webkit.messageHandlers.callbackHandler.postMessage({"action":"alert","data":"playBase64Audio called"});
+
+      if (!base64) return;
+
+      // Build a data URL; the caller supplies raw base64 (no data: prefix)
+      function makeDataUrl(mime) {
+        return 'data:' + mime + ';base64,' + base64;
+      }
+
+      // Ensure an AudioContext exists
+      if (!audioCtx) {
+        try {
+          await startAudio();
+        } catch (e) {
+          // If user denies mic/start, still create an AudioContext for playback
+          try {
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          } catch (err) {
+            console.warn('Cannot create AudioContext for playback', err);
+            return;
+          }
+        }
+      }
+
+      // Stop any existing playback first
+      stopPlayback();
+
+      // We'll decode the base64 into an AudioBuffer and play it silently through an
+      // AudioBufferSourceNode connected only to an analyser (no destination). This
+      // lets the animation follow the audio without audible playback.
+      playAnalyser = audioCtx.createAnalyser();
+      playAnalyser.fftSize = 2048;
+      playAnalyser.smoothingTimeConstant = 0.92;
+
+      // Helper to extract raw base64 if caller passed a data URL
+      let rawBase64 = base64;
+      if (rawBase64.indexOf('data:') === 0) {
+        const comma = rawBase64.indexOf(',');
+        if (comma !== -1) rawBase64 = rawBase64.substring(comma + 1);
+      }
+
+      try {
+        const binary = atob(rawBase64);
+        const len = binary.length;
+        const bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+        // decodeAudioData expects an ArrayBuffer
+        const audioBuffer = await audioCtx.decodeAudioData(bytes.buffer);
+
+        // create a buffer source and connect to analyser only (silent)
+        const src = audioCtx.createBufferSource();
+        src.buffer = audioBuffer;
+        src.connect(playAnalyser);
+        // Do NOT connect playAnalyser to destination — keep silent
+
+        // Temporarily switch the global analyser to the playback analyser so the bubble follows playback
+        analyser = playAnalyser;
+        dataArray = new Float32Array(analyser.fftSize);
+
+        // Disconnect microphone from analyser while 'playing' so it doesn't control the bubble.
+        if (micSource && micAnalyser) {
+          try { micSource.disconnect(micAnalyser); } catch (e) {}
+        }
+
+        // store element-like reference so stopPlayback can stop it
+        playbackAudioEl = { _bufferSource: src };
+        isPlayingAudio = true;
+
+        src.onended = () => {
+          stopPlayback();
+        };
+
+        // resume context if suspended
+        if (audioCtx.state === 'suspended') try { await audioCtx.resume(); } catch (e) {}
+
+        src.start(0);
+        return;
+      } catch (err) {
+        console.warn('decodeAudioData failed for playback-silent mode', err);
+        // try fallback via media element (silent): create an audio element but don't connect to destination
+        try {
+          const audioEl2 = new Audio();
+          audioEl2.src = makeDataUrl(mimeHint);
+          audioEl2.crossOrigin = 'anonymous';
+          playbackAudioEl = audioEl2;
+          try {
+            mediaElementSource = audioCtx.createMediaElementSource(audioEl2);
+            mediaElementSource.connect(playAnalyser);
+            // do NOT connect to destination — keep silent
+            analyser = playAnalyser;
+            dataArray = new Float32Array(analyser.fftSize);
+            if (micSource && micAnalyser) {
+              try { micSource.disconnect(micAnalyser); } catch (e) {}
+            }
+            isPlayingAudio = true;
+            audioEl2.onended = () => stopPlayback();
+            if (audioCtx.state === 'suspended') try { await audioCtx.resume(); } catch (e) {}
+            try { await audioEl2.play(); } catch (e) { /* ignore playback errors */ }
+            return;
+          } catch (e) {
+            console.warn('mediaElement fallback failed', e);
+          }
+        } catch (e) {
+          console.warn('playback fallback failed entirely', e);
+        }
+      }
+    }
+
+    // Stop playback and restore microphone analyser
+    function stopPlayback() {
+      if (!isPlayingAudio) return;
+      isPlayingAudio = false;
+
+      // stop HTMLAudioElement
+      if (playbackAudioEl) {
+        if (playbackAudioEl instanceof HTMLAudioElement) {
+          try { playbackAudioEl.pause(); } catch (e) {}
+          try { playbackAudioEl.src = ''; } catch (e) {}
+        } else if (playbackAudioEl._bufferSource) {
+          try { playbackAudioEl._bufferSource.stop(); } catch (e) {}
+        }
+        playbackAudioEl = null;
+      }
+
+      // disconnect media element source
+      if (mediaElementSource) {
+        try { mediaElementSource.disconnect(); } catch (e) {}
+        mediaElementSource = null;
+      }
+
+      if (playAnalyser) {
+        try { playAnalyser.disconnect(); } catch (e) {}
+        playAnalyser = null;
+      }
+
+      // Restore analyser to microphone analyser (if available)
+      if (micAnalyser) {
+        analyser = micAnalyser;
+        dataArray = new Float32Array(analyser.fftSize);
+        // reconnect micSource to micAnalyser if it was disconnected
+        if (micSource) {
+          try { micSource.connect(micAnalyser); } catch (e) {}
+        }
+      }
+    }
+
+    // ------------------ Loader controls ------------------
+    // Supports: 'open' -> play open.wav once, 'close' -> play close.wav once,
+    // 'loading' -> start an infinite randomized overlapping sequence of small sounds (1.wav..4.wav),
+    // 'stop' -> stop the loading sequence and restore mic control.
+    const loaderFiles = ['audio/1.wav','audio/2.wav','audio/3.wav','audio/4.wav'];
+    const loaderOpenFile = 'audio/open.wav';
+    const loaderCloseFile = 'audio/close.wav';
+    const audioBufferCache = {}; // url -> AudioBuffer
+    let loaderAnalyser = null;
+    let loaderIntervalId = null;
+    let loaderActiveSources = [];
+    let loaderLoopRunning = false;
+
+    async function loadAudioBuffer(url) {
+      if (audioBufferCache[url]) return audioBufferCache[url];
+      if (!audioCtx) {
+        try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { throw e; }
+      }
+      const resp = await fetch(url);
+      const ab = await resp.arrayBuffer();
+      const audioBuffer = await audioCtx.decodeAudioData(ab);
+      audioBufferCache[url] = audioBuffer;
+      return audioBuffer;
+    }
+
+    function playBufferSilent(buffer) {
+      if (!audioCtx) return null;
+      if (!loaderAnalyser) {
+        loaderAnalyser = audioCtx.createAnalyser();
+        loaderAnalyser.fftSize = 2048;
+        loaderAnalyser.smoothingTimeConstant = 0.92;
+      }
+      const src = audioCtx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(loaderAnalyser);
+      // do not connect loaderAnalyser to destination -> silent
+      // switch global analyser to loaderAnalyser while playing
+      analyser = loaderAnalyser;
+      dataArray = new Float32Array(analyser.fftSize);
+      // disconnect mic
+      if (micSource && micAnalyser) {
+        try { micSource.disconnect(micAnalyser); } catch (e) {}
+      }
+      src.start(0);
+      loaderActiveSources.push(src);
+      // remove when ended
+      src.onended = () => {
+        const idx = loaderActiveSources.indexOf(src);
+        if (idx !== -1) loaderActiveSources.splice(idx,1);
+        // if nothing playing and loader loop not running, restore mic
+        if (loaderActiveSources.length === 0 && !loaderLoopRunning) restoreMicAnalyser();
+      };
+      return src;
+    }
+
+    function restoreMicAnalyser() {
+      if (micAnalyser) {
+        analyser = micAnalyser;
+        dataArray = new Float32Array(analyser.fftSize);
+        if (micSource) {
+          try { micSource.connect(micAnalyser); } catch (e) {}
+        }
+      }
+    }
+
+    // main loader API callable from Swift: window.addLoader(action)
+    async function addLoader(action) {
+      if (!action) return;
+      action = String(action);
+      if (!audioCtx) {
+        try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { console.warn('Cannot create AudioContext', e); }
+      }
+
+      if (action === 'open' || action === 'close') {
+        const url = action === 'open' ? loaderOpenFile : loaderCloseFile;
+        try {
+          const buf = await loadAudioBuffer(url);
+          playBufferSilent(buf);
+        } catch (e) {
+          console.warn('addLoader play once failed', e);
+        }
+        return;
+      }
+
+      if (action === 'loading') {
+        if (loaderLoopRunning) return; // already running
+        loaderLoopRunning = true;
+        // ensure analyser exists and mic disconnected
+        if (!loaderAnalyser) {
+          loaderAnalyser = audioCtx.createAnalyser();
+          loaderAnalyser.fftSize = 2048;
+          loaderAnalyser.smoothingTimeConstant = 0.92;
+        }
+        analyser = loaderAnalyser;
+        dataArray = new Float32Array(analyser.fftSize);
+        if (micSource && micAnalyser) {
+          try { micSource.disconnect(micAnalyser); } catch (e) {}
+        }
+
+        // Preload buffers
+        const buffers = [];
+        for (let i = 0; i < loaderFiles.length; i++) {
+          try { buffers.push(await loadAudioBuffer(loaderFiles[i])); } catch (e) { console.warn('load', loaderFiles[i], 'failed', e); }
+        }
+        // schedule random overlapping plays
+        const intervalMs = 350; // how often to start a new random sound
+        loaderIntervalId = setInterval(() => {
+          if (!buffers.length) return;
+          const idx = Math.floor(Math.random() * buffers.length);
+          const buf = buffers[idx];
+          // play but don't await
+          try { playBufferSilent(buf); } catch (e) { console.warn('playBufferSilent failed', e); }
+        }, intervalMs);
+        return;
+      }
+
+      if (action === 'stop') {
+        // stop loop
+        loaderLoopRunning = false;
+        if (loaderIntervalId) {
+          clearInterval(loaderIntervalId);
+          loaderIntervalId = null;
+        }
+        // stop all active sources
+        for (let i = 0; i < loaderActiveSources.length; i++) {
+          try { loaderActiveSources[i].stop(); } catch (e) {}
+        }
+        loaderActiveSources = [];
+        // restore mic analyser
+        restoreMicAnalyser();
+        return;
+      }
     }
 
     // Adapted from original pen:
@@ -584,4 +910,15 @@
         }
     });
 
-})();
+            // Expose selected control functions on window so native code (WKWebView) can call them
+            try {
+              window.playBase64Audio = playBase64Audio;
+              window.stopPlayback = stopPlayback;
+              window.startRecording = startRecording;
+              window.stopRecordingAndSend = stopRecordingAndSend;
+              window.addLoader = addLoader;
+            } catch (e) {
+              // ignore if window isn't writable in some environments
+            }
+
+        })();

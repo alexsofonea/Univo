@@ -24,7 +24,7 @@ class VLMModelManager {
         server.sendRequest(messages: input.0, schema: input.1, image: input.2) { result in
             switch result {
             case .success(let response):
-                print("✅ Received response from TeckyServer: \(response)")
+                //print("✅ Received response from TeckyServer: \(response)")
                 completion(.success(response))
             case .failure(let error):
                 print("❌ Error from TeckyServer: \(error)")
